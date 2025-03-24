@@ -1,0 +1,24 @@
+{
+  "mcpServers": {
+    "sqlite": {
+      "command": "uvx",
+      "args": ["mcp-server-sqlite", "--db-path", "./test.db"]
+    },
+    "tavily-mcp": {
+      "command": "npx",
+      "args": ["-y", "tavily-mcp@0.1.2"],
+      "env": {
+        "TAVILY_API_KEY": "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"
+      }
+    },
+    "get_celeb_info":{
+      "command": "uv",
+      "args":[
+        "--directory",
+        "D:/prompt engineering/code/websearch",
+        "run",
+        "websearch.py"
+      ]
+    }
+  }
+}

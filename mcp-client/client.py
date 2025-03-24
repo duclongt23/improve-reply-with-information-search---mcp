@@ -1,7 +1,10 @@
 import asyncio
 from typing import Optional
-from contextlib import AsyncExitStack
 import json
+from typing import Dict, List, Optional, Any
+import os
+import logging
+import shutil
 
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
@@ -9,161 +12,394 @@ from mcp.client.stdio import stdio_client
 from openai import OpenAI
 from dotenv import load_dotenv
 
-load_dotenv()  # load environment variables from .env
+# Configure logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+class Configuration:
+    """Manages configuration and environment variables for the MCP client."""
 
-class MCPClient:
-    def __init__(self):
-        # Initialize session and client objects
-        self.session: Optional[ClientSession] = None
-        self.exit_stack = AsyncExitStack()
-        #self.anthropic = Anthropic()
-        self.openai = OpenAI()
+    def __init__(self) -> None:
+        """Initialize configuration with environment variables."""
+        self.load_env()
 
-    async def connect_to_server(self, server_script_path: str):
-        """Connect to an MCP server
+    @staticmethod
+    def load_env() -> None:
+        """Load environment variables from .env file."""
+        load_dotenv()
+
+    @staticmethod
+    def load_config(file_path: str) -> Dict[str, Any]:
+        """Load server configuration from JSON file.
         
         Args:
-            server_script_path: Path to the server script (.py or .js)
-        """
-        is_python = server_script_path.endswith('.py')
-        is_js = server_script_path.endswith('.js')
-        if not (is_python or is_js):
-            raise ValueError("Server script must be a .py or .js file")
+            file_path: Path to the JSON configuration file.
             
-        command = "python" if is_python else "node"
+        Returns:
+            Dict containing server configuration.
+            
+        Raises:
+            FileNotFoundError: If configuration file doesn't exist.
+            JSONDecodeError: If configuration file is invalid JSON.
+        """
+        with open(file_path, 'r') as f:
+            return json.load(f)
+
+class Server:
+    """Manages MCP server connections and tool execution."""
+
+    def __init__(self, name: str, config: Dict[str, Any]) -> None:
+        self.name: str = name
+        self.config: Dict[str, Any] = config
+        self.stdio_context: Optional[Any] = None
+        self.session: Optional[ClientSession] = None
+        self._cleanup_lock: asyncio.Lock = asyncio.Lock()
+        self.capabilities: Optional[Dict[str, Any]] = None
+
+    async def initialize(self) -> None:
+        """Initialize the server connection."""
         server_params = StdioServerParameters(
-            command=command,
-            args=[server_script_path],
-            env=None
+            command=shutil.which("npx") if self.config['command'] == "npx" else self.config['command'],
+            args=self.config['args'],
+            env={**os.environ, **self.config['env']} if self.config.get('env') else None    #why **os.environ?
+        )
+        try:
+            self.stdio_context = stdio_client(server_params)
+            read, write = await self.stdio_context.__aenter__()
+            self.session = ClientSession(read, write)
+            await self.session.__aenter__()
+            self.capabilities = await self.session.initialize()
+        except Exception as e:
+            logging.error(f"Error initializing server {self.name}: {e}")
+            await self.cleanup()
+            raise
+
+    async def list_tools(self) -> List[Any]:
+        """List available tools from the server.
+        
+        Returns:
+            A list of available tools.
+            
+        Raises:
+            RuntimeError: If the server is not initialized.
+        """
+        if not self.session:
+            raise RuntimeError(f"Server {self.name} not initialized")
+        
+        tools_response = await self.session.list_tools()
+        tools = []
+        
+        supports_progress = (
+            self.capabilities 
+            and 'progress' in self.capabilities
         )
         
-        stdio_transport = await self.exit_stack.enter_async_context(stdio_client(server_params))
-        self.stdio, self.write = stdio_transport
-        self.session = await self.exit_stack.enter_async_context(ClientSession(self.stdio, self.write))
+        if supports_progress:
+            logging.info(f"Server {self.name} supports progress tracking")
         
-        await self.session.initialize()
+        for item in tools_response:
+            if isinstance(item, tuple) and item[0] == 'tools':
+                for tool in item[1]:
+                    tools.append(Tool(tool.name, tool.description, tool.inputSchema))
+                    if supports_progress:
+                        logging.info(f"Tool '{tool.name}' will support progress tracking")
         
-        # List available tools
-        response = await self.session.list_tools()
-        tools = response.tools
-        print("\nConnected to server with tools:", [tool.name for tool in tools])
+        return tools
 
-    async def process_query(self, query: str) -> str:
-        """Process a query using LLM and available tools"""
-        messages = [{"role": "user", "content": query}]
+    async def execute_tool(
+        self, 
+        tool_name: str, 
+        arguments: Dict[str, Any], 
+        retries: int = 2, 
+        delay: float = 1.0
+    ) -> Any:
+        """Execute a tool with retry mechanism.
+        
+        Args:
+            tool_name: Name of the tool to execute.
+            arguments: Tool arguments.
+            retries: Number of retry attempts.
+            delay: Delay between retries in seconds.
+            
+        Returns:
+            Tool execution result.
+            
+        Raises:
+            RuntimeError: If server is not initialized.
+            Exception: If tool execution fails after all retries.
+        """
+        if not self.session:
+            raise RuntimeError(f"Server {self.name} not initialized")
 
+        attempt = 0
+        while attempt < retries:
+            try:
+                supports_progress = (
+                    self.capabilities 
+                    and 'progress' in self.capabilities
+                )
+
+                if supports_progress:
+                    logging.info(f"Executing {tool_name} with progress tracking...")
+                    result = await self.session.call_tool(
+                        tool_name, 
+                        arguments,
+                        progress_token=f"{tool_name}_execution"
+                    )
+                else:
+                    logging.info(f"Executing {tool_name}...")
+                    result = await self.session.call_tool(tool_name, arguments)
+
+                return result
+
+            except Exception as e:
+                attempt += 1
+                logging.warning(f"Error executing tool: {e}. Attempt {attempt} of {retries}.")
+                if attempt < retries:
+                    logging.info(f"Retrying in {delay} seconds...")
+                    await asyncio.sleep(delay)
+                else:
+                    logging.error("Max retries reached. Failing.")
+                    raise
+
+    async def cleanup(self) -> None:
+        """Clean up server resources."""
+        async with self._cleanup_lock:
+            try:
+                if self.session:
+                    try:
+                        await self.session.__aexit__(None, None, None)
+                    except Exception as e:
+                        logging.warning(f"Warning during session cleanup for {self.name}: {e}")
+                    finally:
+                        self.session = None
+
+                if self.stdio_context:
+                    try:
+                        await self.stdio_context.__aexit__(None, None, None)
+                    except (RuntimeError, asyncio.CancelledError) as e:
+                        logging.info(f"Note: Normal shutdown message for {self.name}: {e}")
+                    except Exception as e:
+                        logging.warning(f"Warning during stdio cleanup for {self.name}: {e}")
+                    finally:
+                        self.stdio_context = None
+            except Exception as e:
+                logging.error(f"Error during cleanup of server {self.name}: {e}")
+
+class Tool:
+    """Represents a tool with its properties and formatting."""
+
+    def __init__(self, name: str, description: str, input_schema: Dict[str, Any]) -> None:
+        self.name: str = name
+        self.description: str = description
+        self.input_schema: Dict[str, Any] = input_schema
+
+    def format_for_llm(self) -> str:
+        """Format tool information for LLM.
+        
+        Returns:
+            A formatted string describing the tool.
+        """
+        args_desc = []
+        if 'properties' in self.input_schema:
+            for param_name, param_info in self.input_schema['properties'].items():
+                arg_desc = f"- {param_name}: {param_info.get('description', 'No description')}"
+                if param_name in self.input_schema.get('required', []):
+                    arg_desc += " (required)"
+                args_desc.append(arg_desc)
+        
+        return f"""
+Tool: {self.name}
+Description: {self.description}
+Arguments:
+{chr(10).join(args_desc)}
+"""
+class LLMClient:
+    """Manages communication with the LLM provider."""
+
+    def __init__(self) -> None:
+        self.openai= OpenAI()
+
+    def get_response(self, messages: List[Dict[str, str]]) -> str:
+        """Get a response from the LLM.
+        
+        Args:
+            messages: A list of message dictionaries.
+            
+        Returns:
+            The LLM's response as a string.
+            
+        Raises:
+            RequestException: If the request to the LLM fails.
+        """
+
+        
         try:
-            # Get available tools
-            tools_response = await self.session.list_tools()
-            available_tools = [{
-                "type": "function",
-                "function": {
-                    "name": tool.name,
-                    "description": tool.description,
-                    "parameters": tool.inputSchema
-                }
-            } for tool in tools_response.tools]
-
-            # Initial API call
             response = self.openai.chat.completions.create(
                 model="gpt-4o-mini",
                 messages=messages,
-                tools=available_tools,
-                max_tokens=1000
+                max_tokens=2000
             )
-
-            final_text = []
-            assistant_message = response.choices[0].message
-
-            # Handle text response
-            if assistant_message.content:
-                final_text.append(assistant_message.content)
-
-            # Handle tool calls
-            if hasattr(assistant_message, "tool_calls") and assistant_message.tool_calls:
-                for tool_call in assistant_message.tool_calls:
-                    try:
-                        tool_name = tool_call.function.name
-                        tool_args = tool_call.function.arguments
-                        
-                        if isinstance(tool_args, str):
-                            tool_args = json.loads(tool_args)
-
-                        # Execute tool
-                        result = await self.session.call_tool(tool_name, tool_args)
-                        final_text.append(f"[Calling tool {tool_name} with args {tool_args}]")
-
-                        # Update conversation
-                        messages.append({
-                            "role": "assistant",
-                            "content": None,
-                            "tool_calls": [{
-                                "id": tool_call.id,
-                                "type": "function",
-                                "function": {
-                                    "name": tool_name,
-                                    "arguments": json.dumps(tool_args)
-                                }
-                            }]
-                        })
-                        messages.append({
-                            "role": "tool",
-                            "tool_call_id": tool_call.id,
-                            "content": str(result.content)  # Đảm bảo content là chuỗi
-                        })
-
-                        # Follow-up API call
-                        response = self.openai.chat.completions.create(
-                            model="gpt-4o-mini",
-                            max_tokens=1000,
-                            messages=messages,
-                        )
-
-                        if response.choices[0].message.content:
-                            final_text.append(response.choices[0].message.content)
-
-                    except Exception as e:
-                        final_text.append(f"Error calling tool {tool_name}: {str(e)}")
-
-            return "\n".join(final_text)
-
+            return response['choices'][0]['message']['content']
+            
         except Exception as e:
-            return f"Error processing query: {str(e)}"
-
-    async def chat_loop(self):
-        """Run an interactive chat loop"""
-        print("\nMCP Client Started!")
-        print("Type your queries or 'quit' to exit.")
-        
-        while True:
-            try:
-                query = input("\nQuery: ").strip()
+            error_message = f"Đã xảy ra lỗi khi xử lý yêu cầu: {str(e)}"
+            logging.error(error_message)
+            if hasattr(e, 'response') and e.response is not None:
+                status_code = e.response.status_code
+                logging.error(f"Status code: {status_code}")
+                logging.error(f"Response details: {e.response.text}")
                 
-                if query.lower() == 'quit':
-                    break
-                    
-                response = await self.process_query(query)
-                print("\n" + response)
-                    
-            except Exception as e:
-                print(f"\nError: {str(e)}")
-    
-    async def cleanup(self):
-        """Clean up resources"""
-        await self.exit_stack.aclose()
+            return f"I encountered an error: {error_message}. Please try again or rephrase your request."
 
-async def main():
-    if len(sys.argv) < 2:
-        print("Usage: python client.py <path_to_server_script>")
-        sys.exit(1)
+class ChatSession:
+    """Orchestrates the interaction between user, LLM, and tools."""
+
+    def __init__(self, servers: List[Server], llm_client: LLMClient) -> None:
+        self.servers: List[Server] = servers
+        self.llm_client: LLMClient = llm_client
+
+    async def cleanup_servers(self) -> None:
+        """Clean up all servers properly."""
+        cleanup_tasks = []
+        for server in self.servers:
+            cleanup_tasks.append(asyncio.create_task(server.cleanup()))
         
-    client = MCPClient()
-    try:
-        await client.connect_to_server(sys.argv[1])
-        await client.chat_loop()
-    finally:
-        await client.cleanup()
+        if cleanup_tasks:
+            try:
+                await asyncio.gather(*cleanup_tasks, return_exceptions=True)
+            except Exception as e:
+                logging.warning(f"Warning during final cleanup: {e}")
+
+    async def process_llm_response(self, llm_response: str) -> str:
+        """Process the LLM response and execute tools if needed.
+        
+        Args:
+            llm_response: The response from the LLM.
+            
+        Returns:
+            The result of tool execution or the original response.
+        """
+        try:
+            tool_call = json.loads(llm_response)
+            if "tool" in tool_call and "arguments" in tool_call:
+                logging.info(f"Executing tool: {tool_call['tool']}")
+                logging.info(f"With arguments: {tool_call['arguments']}")
+                
+                for server in self.servers:
+                    tools = await server.list_tools()
+                    if any(tool.name == tool_call["tool"] for tool in tools):
+                        try:
+                            result = await server.execute_tool(tool_call["tool"], tool_call["arguments"])
+                            
+                            if isinstance(result, dict) and 'progress' in result:
+                                progress = result['progress']
+                                total = result['total']
+                                logging.info(f"Progress: {progress}/{total} ({(progress/total)*100:.1f}%)")
+                                
+                            return f"Tool execution result: {result}"
+                        except Exception as e:
+                            error_msg = f"Error executing tool: {str(e)}"
+                            logging.error(error_msg)
+                            return error_msg
+                
+                return f"No server found with tool: {tool_call['tool']}"
+            return llm_response
+        except json.JSONDecodeError:
+            return llm_response
+
+    async def start(self) -> None:
+        """Main chat session handler."""
+        try:
+            for server in self.servers:
+                try:
+                    await server.initialize()
+                except Exception as e:
+                    logging.error(f"Failed to initialize server: {e}")
+                    await self.cleanup_servers()
+                    return
+            
+            all_tools = []
+            for server in self.servers:
+                tools = await server.list_tools()
+                all_tools.extend(tools)
+            
+            tools_description = "\n".join([tool.format_for_llm() for tool in all_tools])
+            
+            system_message = f"""You are an enthusiastic, witty, and emotionally intelligent social media companion built to respond to celebrity posts on X. Your goal is to craft replies that feel natural, fun, and authentic—like something a real person with a big personality would say. You’re a fan who’s excited but not over-the-top, relatable yet clever, and always in tune with the vibe of the post. To enhance your ability you have access to these tools: 
+
+{tools_description}
+Choose the appropriate tool based on the celebrity you reply and the post content. If no tool is needed, reply directly.
+
+IMPORTANT: When you need to use a tool, you must ONLY respond with the exact JSON object format below, nothing else:
+{{
+    "tool": "tool-name",
+    "arguments": {{
+        "argument-name": "value"
+    }}
+}}
+
+After receiving a tool's response:
+1. Transform the raw data into a natural, conversational response
+2. Keep responses concise but informative
+3. Focus on the most relevant information
+4. Use appropriate context from the user's question
+5. Avoid simply repeating the raw data
+
+Please use only the tools that are explicitly defined above.
+
+Input format:
+User name: <celebrity’s X handle>
+Post content: <text of the celebrity’s post>
+
+Output format:
+<your reply>"""
+
+            while True:
+                try:
+                    messages = [
+                        {
+                            "role": "system",
+                            "content": system_message
+                        }
+                    ]
+
+                    user_input = input("You: ").strip().lower()
+                    if user_input in ['quit', 'exit']:
+                        logging.info("\nExiting...")
+                        break
+
+                    messages.append({"role": "user", "content": user_input})
+                    
+                    llm_response = self.llm_client.get_response(messages)
+                    logging.info("\nAssistant: %s", llm_response)
+
+                    result = await self.process_llm_response(llm_response)
+                    
+                    if result != llm_response:
+                        messages.append({"role": "assistant", "content": llm_response})
+                        messages.append({"role": "system", "content": result})
+                        
+                        final_response = self.llm_client.get_response(messages)
+                        logging.info("\nFinal response: %s", final_response)
+                        messages.append({"role": "assistant", "content": final_response})
+                    else:
+                        messages.append({"role": "assistant", "content": llm_response})
+
+                except KeyboardInterrupt:
+                    logging.info("\nExiting...")
+                    break
+        
+        finally:
+            await self.cleanup_servers()
+
+
+async def main() -> None:
+    """Initialize and run the chat session."""
+    config = Configuration()
+    server_config = config.load_config('servers_config.json')
+    servers = [Server(name, srv_config) for name, srv_config in server_config['mcpServers'].items()]
+    llm_client = LLMClient() 
+    chat_session = ChatSession(servers, llm_client)
+    await chat_session.start()
 
 if __name__ == "__main__":
-    import sys
     asyncio.run(main())

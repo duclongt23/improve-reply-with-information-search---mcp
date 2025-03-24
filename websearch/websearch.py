@@ -1,7 +1,6 @@
 from mcp.server.fastmcp import FastMCP
 from openai import OpenAI
 from tavily import TavilyClient
-import re
 from dotenv import load_dotenv
 from openai import OpenAI
 import os
@@ -24,21 +23,6 @@ def gg_tool(celeb_name):
     except Exception as e:
         return f"Lỗi khi tìm kiếm: {str(e)}"
 
-def preprocess_for_llm(raw_text):
-    entries = raw_text.strip().split("\n---\n")
-    processed_entries = []
-    for entry in entries:
-        lines = entry.split("\n")
-        if len(lines) >= 2:
-            title = lines[0].replace("title: ", "").strip()
-            content = " ".join(lines[1:]).replace("content: ", "").strip()
-            content = re.sub(r'https?://\S+', '', content)  # Xóa URL
-            content = re.sub(r'\[\d+\](?:\[\d+\])*', '', content)  # Xóa chú thích
-            content = " ".join(content.split())
-            processed_entries.append(f"Title: {title}\nContent: {content}")
-    final_text = "\n\n".join(processed_entries)
-    return final_text
-
 def celeb_info(celeb_name):
     try:
         completion = client.chat.completions.create(
@@ -57,7 +41,7 @@ Output should be in the following format:
             },
             {
                 "role": "user",
-                "content": preprocess_for_llm(gg_tool(celeb_name))
+                "content": gg_tool(celeb_name)
             }
             ] 
         )
