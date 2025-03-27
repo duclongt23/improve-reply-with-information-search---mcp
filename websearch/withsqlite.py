@@ -68,5 +68,4 @@ def gg_tool(celeb_name, max_results=5):
 if __name__ == "__main__":
     init_db()
     # Ví dụ sử dụng
-    print(gg_tool("Tom Cruise"))  # Lần đầu: gọi API, lưu DB
-    print(gg_tool("Tom Cruise"))  # Lần hai: lấy từ DB
+    print(gg_tool("J97"))  # Lần đầu: gọi API, lưu DB
