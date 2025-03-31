@@ -3,9 +3,12 @@ import time
 from tavily import TavilyClient
 import os
 from dotenv import load_dotenv
+from openai import OpenAI
+
 
 load_dotenv()
 
+client = OpenAI()
 # Khởi tạo cơ sở dữ liệu
 def init_db():
     conn = sqlite3.connect("celebrity_cache.db")  # Tạo file DB
@@ -64,8 +67,35 @@ def gg_tool(celeb_name, max_results=5):
     except Exception as e:
         return f"Search error: {str(e)}"
 
+def celeb_info(celeb_name):
+    try:
+        completion = client.chat.completions.create(
+            model= "gpt-4o-mini",
+            messages=[
+            {
+                "role": "system",
+                "content": """You are an expert at extracting precise, relevant information from text. Given the following text about a celebrity, extract only the key details below if possible, only answer the output. Ignore irrelevant or redundant information:
+Output should be in the following format:
+- Basic Info (name, age, occupation)
+- Achievements (notable accomplishments like records, awards, or contributions)
+- Recent Events (specific dates and events from 2022 onward)
+- Interests/Passions (hobbies or causes they care about)
+- Personal Style/Tone (their communication style, e.g., humorous, formal)
+- url to social media (if available)
+"""
+            },
+            {
+                "role": "user",
+                "content": gg_tool(celeb_name)
+            }
+            ] 
+        )
+        return completion.choices[0].message.content
+    except Exception as e:
+        return f"Lỗi khi gọi LLM: {str(e)}"
+
 # Khởi tạo DB khi chạy chương trình
 if __name__ == "__main__":
     init_db()
     # Ví dụ sử dụng
-    print(gg_tool("J97"))  # Lần đầu: gọi API, lưu DB
+    print(celeb_info("J97"))  # Lần đầu: gọi API, lưu DB

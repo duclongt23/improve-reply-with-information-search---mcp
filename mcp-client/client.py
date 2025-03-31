@@ -264,7 +264,7 @@ class ChatSession:
             except Exception as e:
                 logging.warning(f"Warning during final cleanup: {e}")
 
-    async def process_llm_response(self, tool_name, tool_args) -> str:
+    async def process_llm_response(self, tool_name:str, tool_args:Dict[str, Any]) -> str:
         """Process the LLM response and execute tools if needed.
         
         Args:
@@ -278,8 +278,6 @@ class ChatSession:
             if any(tool.name == tool_name for tool in tools):
 
                 try:
-                    tool_name = json.load(tool_name)
-                    tool_args = json.load(tool_args)
                     result = await server.execute_tool(tool_name, tool_args)
                     
                     if isinstance(result, dict) and 'progress' in result:
@@ -289,7 +287,7 @@ class ChatSession:
                         
                     return result
                 except Exception as e:
-                    error_msg = f"Error executing tool: {str(e)}"
+                    error_msg = f"Error executing tool ({tool_name}, arg:{tool_args}): {str(e)}"
                     logging.error(error_msg)
                     return error_msg
         
@@ -320,36 +318,36 @@ class ChatSession:
                     "parameters": tool.input_schema
                 }
             } for tool in all_tools]
-
+            print(f"Connected successfully! Available tools: {[tool.name for tool in all_tools]}")
             tools_description = "\n".join([tool.format_for_llm() for tool in all_tools])
             
-            system_message = f"""You are an enthusiastic, witty, and emotionally intelligent social media companion built to respond to celebrity posts on X. Your goal is to craft replies that feel natural, fun, and authentic—like something a real person with a big personality would say. You’re a fan who’s excited but not over-the-top, relatable yet clever, and always in tune with the vibe of the post. To enhance your reply you have access to these tools: 
+#             system_message = f"""You are an enthusiastic, witty, and emotionally intelligent social media companion built to respond to celebrity posts on X. Your goal is to craft replies that feel natural, fun, and authentic—like something a real person with a big personality would say. You’re a fan who’s excited but not over-the-top, relatable yet clever, and always in tune with the vibe of the post. To enhance your reply you have access to these tools: 
 
-{tools_description}
-Choose the appropriate tool based on the celebrity you reply and the post content. Use the tools to extract relevant information and respond accordingly.
+# {tools_description}
+# Choose the appropriate tool based on the celebrity you reply and the post content. Use the tools to extract relevant information and respond accordingly.
 
-IMPORTANT: When you need to use a tool, you must ONLY respond with the exact JSON object format below, nothing else:
-{{
-    "tool": "tool-name",
-    "arguments": {{
-        "argument-name": "value"
-    }}
-}}
+# IMPORTANT: When you need to use a tool, you must ONLY respond with the exact JSON object format below, nothing else:
+# {{
+#     "tool": "tool-name",
+#     "arguments": {{
+#         "argument-name": "value"
+#     }}
+# }}
 
-After receiving a tool's response:
-1. Transform the raw data into a natural response
-2. Keep responses concise but informative
-3. Focus on the most relevant information
-4. Use appropriate context from the celebrity's post and celebrity's information
+# After receiving a tool's response:
+# 1. Transform the raw data into a natural response
+# 2. Keep responses concise but informative
+# 3. Focus on the most relevant information
+# 4. Use appropriate context from the celebrity's post and celebrity's information
 
-Please use only the tools that are explicitly defined above.
+# Please use only the tools that are explicitly defined above.
 
-Input format:
-User name: <celebrity’s X handle>
-Post content: <text of the celebrity’s post>
+# Input format:
+# User name: <celebrity’s X handle>
+# Post content: <text of the celebrity’s post>
 
-Output format:
-<your reply>"""
+# Output format:
+# <your reply>"""
             system_message = """You are an enthusiastic, witty, and emotionally intelligent social media companion built to respond to celebrity posts on X. Your goal is to craft replies that feel natural, fun, and authentic—like something a real person with a big personality would say. You’re a fan who’s excited but not over-the-top, relatable yet clever, and always in tune with the vibe of the post.
 
 Here’s how you roll:
@@ -401,7 +399,7 @@ Output format:
                     if hasattr(assistant_message, "tool_calls") and assistant_message.tool_calls:
                         for tool_call in assistant_message.tool_calls:
                             tool_name = tool_call.function.name
-                            tool_args = tool_call.function.arguments
+                            tool_args = json.loads(tool_call.function.arguments) if isinstance(tool_call.function.arguments, str) else tool_call.function.arguments
                             
                             result = await self.process_llm_response(tool_name, tool_args)
                             final_text.append(f"[Tool {tool_name} result: {result.content}]")

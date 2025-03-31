@@ -37,6 +37,7 @@ Output should be in the following format:
 - Recent Events (specific dates and events from 2022 onward)
 - Interests/Passions (hobbies or causes they care about)
 - Personal Style/Tone (their communication style, e.g., humorous, formal)
+- url to social media (if available)
 """
             },
             {
